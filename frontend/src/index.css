@@ -1,0 +1,44 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+    --border: 240 5.9% 90%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+  }
+  .dark {
+    --background: 0 0% 0%;         /* Pure Black Vercel style */
+    --foreground: 0 0% 90%;
+    --card: 0 0% 4%;               /* Slightly offset for cards */
+    --card-foreground: 0 0% 90%;
+    --border: 0 0% 15%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 0 0% 9%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-[color:hsl(var(--border))];
+  }
+  body {
+    @apply bg-[color:hsl(var(--background))] text-[color:hsl(var(--foreground))];
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+.glass-panel {
+  @apply bg-white dark:bg-[#0a0a0a] border border-gray-200 dark:border-[#333] shadow-sm;
+}
+.hero-gradient {
+  background: linear-gradient(135deg, rgba(59,130,246,0.1) 0%, rgba(139,92,246,0.1) 100%);
+}
