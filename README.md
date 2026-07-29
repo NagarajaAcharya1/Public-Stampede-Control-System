@@ -1,6 +1,30 @@
 # CrowdPulse
 
-A real-time crowd monitoring system built for malls, events, and public venues. Two IR sensors connected to a single ESP32 track people entering and exiting. The data is sent over WiFi to a Node.js backend and displayed live on a React dashboard. A buzzer sounds an alert when the crowd exceeds the defined capacity limit.
+A real-time crowd monitoring system with **automatic network discovery**. Connect any WiFi network, and all devices (ESP32, laptops, phones) automatically find and connect to each other. Two IR sensors on ESP32 track people entering/exiting, data flows to Node.js backend, and live updates appear on React dashboard across all connected devices.
+
+## 🚀 Quick Setup
+
+1. **Start Backend**: `cd backend && npm run dev`
+2. **Start Frontend**: `cd frontend && npm run dev` 
+3. **Upload ESP32**: Flash `esp32/crowd_pulse.ino`
+4. **Connect ESP32 to WiFi**:
+   - ESP32 creates `CrowdPulse-XXXXXX` hotspot
+   - Connect phone to hotspot (password: `crowd123`)
+   - Open `http://192.168.4.1` → Select your WiFi → Enter password
+   - ESP32 connects and remembers WiFi forever
+5. **Access Dashboard**: Open `http://localhost:5173` → Login with admin/password
+
+**That's it!** ESP32 auto-discovers the backend server on your network.
+
+## Key Features
+
+- **🔍 Auto-Discovery**: ESP32 and frontend automatically find backend server
+- **📱 Multi-Device**: Access from phones, tablets, laptops on same network  
+- **🌐 Any WiFi**: Works on home, office, or public networks
+- **⚡ Real-time**: Live updates via WebSocket across all devices
+- **🔄 Resilient**: Auto-reconnects if connections drop
+- **🚫 Zero Config**: No IP addresses to configure manually
+- **💾 WiFi Memory**: ESP32 remembers network credentials
 
 ---
 
@@ -224,25 +248,30 @@ Admin-only. Manage users and system configuration.
 
 **File:** `esp32/crowd_pulse.ino`
 
-### Configuration (top of file)
+### Configuration
+
+No hardcoded WiFi credentials needed! The ESP32 uses WiFiManager for dynamic provisioning:
+
+- **First boot**: Creates `CrowdPulse-XXXXXX` hotspot
+- **Captive portal**: Go to `http://192.168.4.1` to select network
+- **Persistent storage**: Remembers WiFi credentials using Preferences library
+- **Auto-reconnect**: Connects to saved network on subsequent boots
+- **Server discovery**: Automatically finds backend server on the network
 
 ```cpp
-const char* ssid      = "NetKing";           // WiFi name
-const char* password  = "11111111";          // WiFi password
-const char* SERVER    = "http://192.168.1.44:5000"; // Backend IP
-const int   MAX_PEOPLE = 15;                 // Buzzer alert threshold
-const unsigned long COOLDOWN_MS = 1200;      // ms between detections
+const int MAX_PEOPLE = 15;                   // Buzzer alert threshold
+const unsigned long COOLDOWN_MS = 800;       // ms between detections (reduced for better response)
 ```
 
 ### How detection works
 
-Uses **falling-edge detection** — triggers only when the sensor output transitions from HIGH to LOW. This prevents a stationary object from being counted multiple times.
+Uses **falling-edge detection with internal pullup resistors** — triggers only when the sensor output transitions from HIGH to LOW. This prevents a stationary object from being counted multiple times.
 
 ```
 lastState == HIGH  →  currentState == LOW  →  person detected (one count)
 ```
 
-A `COOLDOWN_MS` (1200ms) gap is enforced between detections on each sensor to prevent double-counting a single person.
+A `COOLDOWN_MS` (800ms) gap is enforced between detections on each sensor to prevent double-counting a single person. The internal pullup resistors ensure stable HIGH state when no object is detected.
 
 ### Non-blocking buzzer
 
@@ -250,8 +279,10 @@ The buzzer is driven without `delay()` using a state machine (`buzzerActive`, `b
 
 ### WiFi resilience
 
-- Auto-reconnects if WiFi drops (checked every 5 seconds)
-- Failed HTTP POSTs are queued (`pendingEntry` / `pendingExit`) and retried on the next loop iteration
+- **Persistent credentials**: Saves WiFi credentials using ESP32 Preferences library
+- **Auto-reconnects**: Attempts to reconnect using saved credentials if WiFi drops
+- **Fallback portal**: If saved credentials fail, starts captive portal again
+- **Failed HTTP POSTs**: Queued (`pendingEntry` / `pendingExit`) and retried on the next loop iteration
 
 ### Loop flow
 
@@ -394,10 +425,19 @@ Dashboard opens at `http://localhost:5173`
 ### 3. ESP32
 
 1. Open `esp32/crowd_pulse.ino` in Arduino IDE
-2. Set board to `ESP32 Dev Module`
-3. Verify WiFi credentials and server IP at the top of the file
+2. Install required libraries:
+   - WiFiManager by tzapu
+   - ArduinoJson by Benoit Blanchon
+3. Set board to `ESP32 Dev Module`
 4. Upload to the ESP32
-5. Open Serial Monitor at `115200 baud` to verify connections
+5. Open Serial Monitor at `115200 baud` to see connection process
+6. **First time setup**:
+   - ESP32 creates `CrowdPulse-XXXXXX` WiFi hotspot
+   - Connect your phone/laptop to this hotspot (password: `crowdpulse123`)
+   - Go to `http://192.168.4.1` in browser
+   - Select your WiFi network and enter password
+   - ESP32 will connect and remember these credentials
+7. **Subsequent boots**: ESP32 automatically connects to saved WiFi
 
 ### Environment Variables (`backend/.env`)
 
@@ -416,3 +456,5 @@ NODE_ENV=development
 | Username | `admin` |
 | Password | `password` |
 | Role | Admin |
+#   I n t e r n s h i p P r o j e c t 2 _ C r o w d P u l s e  
+ 
