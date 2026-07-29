@@ -1,47 +1,95 @@
-# CrowdPulse — ESP32 Firmware
+# ESP32 CrowdPulse Firmware
 
-Single ESP32 with two IR sensors (Entry + Exit) and a buzzer.
+## Wiring Diagram
 
-## Wiring
+| Component | Pin | ESP32 GPIO | Notes |
+|---|---|---|---|
+| IR Entry Sensor | OUT | GPIO 34 | Input-only pin with internal pullup |
+| IR Exit Sensor | OUT | GPIO 35 | Input-only pin with internal pullup |
+| Buzzer | + | GPIO 25 | Active buzzer |
+| All sensors | VCC | 3.3V | Power supply |
+| All sensors | GND | GND | Ground |
 
-| Component        | ESP32 Pin  |
-|------------------|------------|
-| Entry IR — VCC   | 3.3V       |
-| Entry IR — GND   | GND        |
-| Entry IR — OUT   | GPIO 34    |
-| Exit IR  — VCC   | 3.3V       |
-| Exit IR  — GND   | GND        |
-| Exit IR  — OUT   | GPIO 35    |
-| Buzzer   — +     | GPIO 25    |
-| Buzzer   — −     | GND        |
+## Required Libraries
 
-> GPIO 34 and 35 are input-only pins on ESP32 — do not use them as outputs.
+Install these libraries in Arduino IDE (Tools → Manage Libraries):
 
-## Configuration (top of sketch)
+1. **WiFiManager** by tzapu (v2.0.16-rc.2 or later)
+2. **ArduinoJson** by Benoit Blanchon (v6.21.3 or later)
 
-| Constant       | Default          | Description                                      |
-|----------------|------------------|--------------------------------------------------|
-| `ssid`         | `"NetKing"`      | Your WiFi SSID                                   |
-| `password`     | `"11111111"`     | Your WiFi password                               |
-| `SERVER`       | `http://10.61.190.197:5000` | Backend IP — must match your machine's LAN IP |
-| `COOLDOWN_MS`  | `1200`           | Min ms between counts (prevents double-trigger)  |
-| `MAX_PEOPLE`   | `50`             | Local buzzer overcrowd threshold                 |
+## Upload Instructions
 
-## Upload Steps
+1. Open `crowd_pulse.ino` in Arduino IDE
+2. Select **ESP32 Dev Module** as board
+3. Set upload speed to **115200**
+4. Connect ESP32 via USB and select correct COM port
+5. Click Upload
 
-1. Open **Arduino IDE**
-2. Install board: **ESP32 by Espressif** via Board Manager
-3. Select board: `ESP32 Dev Module`
-4. Open `crowd_pulse.ino` → select the correct COM port → Upload
-5. Open Serial Monitor at **115200 baud** to verify detections
+## First Time Setup
 
-## How it works
+1. **Power on ESP32** - it will create a WiFi hotspot
+2. **Connect to hotspot**: `CrowdPulse-XXXXXX` (password: `crowdpulse123`)
+3. **Open browser**: Go to `http://192.168.4.1`
+4. **Select network**: Choose your WiFi network from the list
+5. **Enter password**: Type your WiFi password
+6. **Save**: ESP32 will connect and remember these credentials
 
-- IR sensor output is **HIGH** at rest, goes **LOW** when beam is broken
-- Falling edge (HIGH → LOW) triggers entry or exit count
-- Each event POSTs `{"count": 1}` to `/api/iot/entry` or `/api/iot/exit`
-- The backend updates the zone occupancy and emits a `zone-update` socket event
-- The dashboard receives the socket event and updates in real-time
-- If WiFi drops, the ESP32 auto-reconnects every 5 seconds
-- If an HTTP POST fails, it is retried on the next loop iteration
-- Buzzer: 1 beep per person, 4 rapid beeps when `MAX_PEOPLE` is exceeded
+## Subsequent Boots
+
+- ESP32 automatically connects to saved WiFi network
+- No need to repeat setup process
+- If WiFi fails, it will create hotspot again
+
+## Serial Monitor Output
+
+Open Serial Monitor at **115200 baud** to see:
+- WiFi connection status
+- Server discovery process
+- Sensor detection events
+- HTTP POST results
+
+## Troubleshooting
+
+**ESP32 not creating hotspot:**
+- Check power supply (use USB cable, not just power adapter)
+- Press EN (reset) button on ESP32
+- Verify upload was successful
+
+**Sensors not detecting:**
+- Check wiring connections
+- Verify sensors have power (3.3V)
+- Test sensors individually with multimeter
+- Ensure sensors are positioned correctly (facing the detection area)
+
+**WiFi connection fails:**
+- Double-check WiFi password
+- Ensure network is 2.4GHz (ESP32 doesn't support 5GHz)
+- Try moving ESP32 closer to router
+
+**Server not found:**
+- Ensure backend is running on same network
+- Check backend server IP in Serial Monitor
+- Verify firewall isn't blocking port 5000
+
+## Performance Optimizations
+
+- **Fast Detection**: 300ms cooldown between detections (reduced from 800ms)
+- **Debounced Reading**: 3-sample debouncing with 10ms intervals for accuracy
+- **Quick HTTP**: 3-second timeout, minimal JSON payload
+- **Faster Buzzer**: 80ms beep timing for immediate feedback
+- **Reduced Delays**: 20ms main loop delay for responsive detection
+
+## Sensor Behavior
+
+- **Normal operation**: 1 beep per person entry/exit
+- **Overcrowd alert**: 6 rapid beeps when local count > 15 people
+- **Config mode**: 3 beeps when entering WiFi setup mode
+- **Success**: 2 beeps when WiFi credentials saved
+
+## Reset WiFi Credentials
+
+To clear saved WiFi and start fresh:
+1. Uncomment `// wifiManager.resetSettings();` in the code
+2. Upload to ESP32
+3. Power cycle the device
+4. Comment out the line again and re-upload

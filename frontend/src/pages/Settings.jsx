@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import apiService from '../services/apiService';
 import { Settings as SettingsIcon, Save, Plus, Trash2, ShieldAlert } from 'lucide-react';
 
 export default function Settings() {
@@ -14,8 +14,8 @@ export default function Settings() {
 
   const fetchZones = async () => {
     try {
-      const res = await axios.get('http://localhost:5000/api/zones');
-      setZones(res.data);
+      const data = await apiService.getZones();
+      setZones(data);
       setLoading(false);
     } catch (err) {
       console.error(err);
@@ -27,7 +27,7 @@ export default function Settings() {
     e.preventDefault();
     if (!newZoneName || !newZoneCapacity) return;
     try {
-      await axios.post('http://localhost:5000/api/zones', {
+      await apiService.createZone({
         name: newZoneName,
         capacity: parseInt(newZoneCapacity, 10),
         densityStatus: 'Low',
@@ -45,7 +45,7 @@ export default function Settings() {
   const handleDeleteZone = async (id) => {
     if (!confirm('Warning: Deleting a zone removes it permanently. Continue?')) return;
     try {
-      await axios.delete(`http://localhost:5000/api/zones/${id}`);
+      await apiService.deleteZone(id);
       fetchZones();
     } catch (err) {
       console.error(err);
@@ -55,7 +55,7 @@ export default function Settings() {
   const handleClearAlerts = async () => {
     if (!confirm('Warning: This clears all alerts in the system. Continue?')) return;
     try {
-      await axios.delete('http://localhost:5000/api/alerts');
+      await apiService.clearAlerts();
       alert('Alerts cleared successfully!');
     } catch (err) {
       console.error(err);

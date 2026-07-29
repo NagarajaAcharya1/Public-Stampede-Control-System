@@ -1,5 +1,5 @@
 import { createContext, useState, useEffect } from 'react';
-import axios from 'axios';
+import apiService from '../services/apiService';
 
 export const AuthContext = createContext();
 
@@ -18,19 +18,21 @@ export const AuthProvider = ({ children }) => {
 
   const login = async (username, password) => {
     try {
-      const res = await axios.post('http://localhost:5000/api/auth/login', { username, password });
-      localStorage.setItem('token', res.data.token);
-      localStorage.setItem('user', JSON.stringify(res.data.user));
-      setUser(res.data.user);
+      const data = await apiService.login(username, password);
+      localStorage.setItem('token', data.token);
+      localStorage.setItem('user', JSON.stringify(data.user));
+      setUser(data.user);
       return { success: true };
     } catch (err) {
-      return { success: false, message: err.response?.data?.message || 'Login failed' };
+      console.error('Login error:', err);
+      const errorMessage = err.response?.data?.error || err.response?.data?.message || err.message || 'Login failed';
+      return { success: false, message: errorMessage };
     }
   };
 
   const register = async (username, password, role) => {
     try {
-      await axios.post('http://localhost:5000/api/auth/register', { username, password, role });
+      await apiService.register(username, password, role);
       return { success: true };
     } catch (err) {
       return { success: false, message: err.response?.data?.message || 'Registration failed' };
@@ -39,9 +41,9 @@ export const AuthProvider = ({ children }) => {
 
   const updateProfile = async (oldUsername, newUsername, newPassword) => {
     try {
-      const res = await axios.put('http://localhost:5000/api/auth/profile', { oldUsername, newUsername, newPassword });
-      localStorage.setItem('user', JSON.stringify(res.data.user));
-      setUser(res.data.user);
+      const data = await apiService.updateProfile(oldUsername, newUsername, newPassword);
+      localStorage.setItem('user', JSON.stringify(data.user));
+      setUser(data.user);
       return { success: true };
     } catch (err) {
       return { success: false, message: err.response?.data?.message || 'Profile update failed' };

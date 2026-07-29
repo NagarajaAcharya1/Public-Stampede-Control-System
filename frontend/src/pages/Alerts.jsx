@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
 import { socket } from '../services/socket';
+import apiService from '../services/apiService';
 import { AlertTriangle, MapPin, Clock, CheckCircle } from 'lucide-react';
 
 export default function Alerts() {
@@ -27,8 +27,8 @@ export default function Alerts() {
 
   const fetchAlerts = async () => {
     try {
-      const res = await axios.get('http://localhost:5000/api/alerts');
-      setAlerts(res.data);
+      const data = await apiService.getAlerts();
+      setAlerts(data);
       setLoading(false);
     } catch (err) {
       console.error(err);
@@ -38,8 +38,8 @@ export default function Alerts() {
 
   const handleResolve = async (id) => {
     try {
-      const res = await axios.patch(`http://localhost:5000/api/alerts/${id}/resolve`);
-      setAlerts(prev => prev.map(a => a._id === id ? res.data : a));
+      const updated = await apiService.resolveAlert(id);
+      setAlerts(prev => prev.map(a => a._id === id ? updated : a));
     } catch (err) {
       console.error(err);
     }

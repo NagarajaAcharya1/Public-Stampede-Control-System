@@ -7,160 +7,379 @@ const MissingPerson = require('../models/MissingPerson');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 
-// --- Auth Routes ---
-router.post('/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const user = await User.findOne({ username });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(401).json({ message: 'Invalid config' });
+// Logging helper
+const logEvent = (type, message, data = null) => {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] [${type.toUpperCase()}] ${message}`);
+  if (data) {
+    console.log(`[${timestamp}] [DATA]`, JSON.stringify(data, null, 2));
+  }
+};
 
-    const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
-    res.json({ token, user: { username: user.username, role: user.role } });
+// Request validation middleware
+const validateRequest = (requiredFields = []) => {
+  return (req, res, next) => {
+    const missing = requiredFields.filter(field => !req.body[field]);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        missing,
+        received: Object.keys(req.body)
+      });
+    }
+    next();
+  };
+};
+
+// Enhanced error handler
+const handleError = (res, error, context = 'Operation') => {
+  logEvent('ERROR', `${context} failed: ${error.message}`, { error: error.stack });
+  res.status(500).json({
+    error: `${context} failed`,
+    message: error.message,
+    timestamp: new Date().toISOString()
+  });
+};
+
+// ============================================================================
+// DASHBOARD ROUTE - REQUIRED
+// ============================================================================
+router.get('/dashboard', async (req, res) => {
+  try {
+    const zone = await Zone.findOne({ name: 'Entry' });
+    const activeAlerts = await Alert.countDocuments({ status: 'Active' });
+    const totalAlerts = await Alert.countDocuments();
+    const recentAlerts = await Alert.find()
+      .populate('zoneId')
+      .sort({ createdAt: -1 })
+      .limit(10);
+
+    const dashboardData = {
+      status: 'active',
+      timestamp: new Date().toISOString(),
+      occupancy: {
+        totalEntered: zone?.totalEntered || 0,
+        totalExited: zone?.totalExited || 0,
+        currentStrength: zone?.currentOccupancy || 0,
+        capacity: zone?.capacity || 15,
+        densityStatus: zone?.densityStatus || 'Low',
+        percentage: zone ? Math.round((zone.currentOccupancy / zone.capacity) * 100) : 0
+      },
+      alerts: {
+        active: activeAlerts,
+        total: totalAlerts,
+        recent: recentAlerts
+      },
+      system: {
+        uptime: process.uptime(),
+        connectedClients: req.io ? req.io.engine.clientsCount : 0
+      }
+    };
+
+    logEvent('DASHBOARD', 'Dashboard data requested', {
+      currentStrength: dashboardData.occupancy.currentStrength,
+      activeAlerts: dashboardData.alerts.active,
+      clientIP: req.ip
+    });
+
+    res.json(dashboardData);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Dashboard data fetch');
   }
 });
 
-router.post('/auth/register', async (req, res) => {
-  const { username, password, role } = req.body;
+// ============================================================================
+// ESP32 IOT ROUTES - ENHANCED WITH LOGGING
+// ============================================================================
+
+// ESP32 Entry Detection
+router.post('/iot/entry', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
+    const { count } = req.body;
+    const entryCount = count || 1;
+    
+    let zone = await Zone.findOne({ name: 'Entry' });
+    if (!zone) {
+      logEvent('ERROR', 'Entry zone not found in database');
+      return res.status(404).json({ 
+        error: 'Entry zone not found',
+        message: 'Database may not be properly initialized'
+      });
+    }
+
+    // Update zone data
+    const previousOccupancy = zone.currentOccupancy;
+    zone.currentOccupancy += entryCount;
+    zone.totalEntered = (zone.totalEntered || 0) + entryCount;
+    
+    // Update density status
+    updateZoneDensity(zone);
+    await zone.save();
+
+    // Check for alerts
+    await checkThreshold(zone, req.io);
+
+    // Emit real-time update
+    if (req.io) {
+      req.io.emit('zone-update', zone);
+      logEvent('SOCKET', 'Zone update broadcasted to all clients');
+    }
+
+    const processingTime = Date.now() - startTime;
+    
+    logEvent('ENTRY', `Person entered - Count: ${entryCount}`, {
+      previousOccupancy,
+      newOccupancy: zone.currentOccupancy,
+      totalEntered: zone.totalEntered,
+      densityStatus: zone.densityStatus,
+      processingTime: `${processingTime}ms`,
+      clientIP: req.ip
+    });
+
+    res.json({
+      success: true,
+      message: 'Entry recorded successfully',
+      data: {
+        currentOccupancy: zone.currentOccupancy,
+        totalEntered: zone.totalEntered,
+        densityStatus: zone.densityStatus,
+        capacity: zone.capacity,
+        percentage: Math.round((zone.currentOccupancy / zone.capacity) * 100)
+      },
+      timestamp: new Date().toISOString(),
+      processingTime: `${processingTime}ms`
+    });
+
+  } catch (err) {
+    logEvent('ERROR', 'Entry processing failed', { 
+      error: err.message, 
+      requestBody: req.body,
+      clientIP: req.ip
+    });
+    handleError(res, err, 'Entry processing');
+  }
+});
+
+// ESP32 Exit Detection
+router.post('/iot/exit', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { count } = req.body;
+    const exitCount = count || 1;
+    
+    let zone = await Zone.findOne({ name: 'Entry' });
+    if (!zone) {
+      logEvent('ERROR', 'Entry zone not found in database');
+      return res.status(404).json({ 
+        error: 'Entry zone not found',
+        message: 'Database may not be properly initialized'
+      });
+    }
+
+    // Update zone data
+    const previousOccupancy = zone.currentOccupancy;
+    zone.currentOccupancy = Math.max(0, zone.currentOccupancy - exitCount);
+    zone.totalExited = (zone.totalExited || 0) + exitCount;
+    
+    // Update density status
+    updateZoneDensity(zone);
+    await zone.save();
+
+    // Emit real-time update
+    if (req.io) {
+      req.io.emit('zone-update', zone);
+      logEvent('SOCKET', 'Zone update broadcasted to all clients');
+    }
+
+    const processingTime = Date.now() - startTime;
+    
+    logEvent('EXIT', `Person exited - Count: ${exitCount}`, {
+      previousOccupancy,
+      newOccupancy: zone.currentOccupancy,
+      totalExited: zone.totalExited,
+      densityStatus: zone.densityStatus,
+      processingTime: `${processingTime}ms`,
+      clientIP: req.ip
+    });
+
+    res.json({
+      success: true,
+      message: 'Exit recorded successfully',
+      data: {
+        currentOccupancy: zone.currentOccupancy,
+        totalExited: zone.totalExited,
+        densityStatus: zone.densityStatus,
+        capacity: zone.capacity,
+        percentage: Math.round((zone.currentOccupancy / zone.capacity) * 100)
+      },
+      timestamp: new Date().toISOString(),
+      processingTime: `${processingTime}ms`
+    });
+
+  } catch (err) {
+    logEvent('ERROR', 'Exit processing failed', { 
+      error: err.message, 
+      requestBody: req.body,
+      clientIP: req.ip
+    });
+    handleError(res, err, 'Exit processing');
+  }
+});
+
+// ============================================================================
+// DASHBOARD STATS - ENHANCED
+// ============================================================================
+router.get('/stats', async (req, res) => {
+  try {
+    const zone = await Zone.findOne({ name: 'Entry' });
+    const activeAlerts = await Alert.countDocuments({ status: 'Active' });
+    
+    const stats = {
+      totalEntered: zone?.totalEntered || 0,
+      totalExited: zone?.totalExited || 0,
+      currentStrength: zone?.currentOccupancy || 0,
+      capacity: zone?.capacity || 15,
+      densityStatus: zone?.densityStatus || 'Low',
+      activeAlerts,
+      timestamp: new Date().toISOString(),
+      percentage: zone ? Math.round((zone.currentOccupancy / zone.capacity) * 100) : 0
+    };
+
+    logEvent('STATS', 'Stats requested', {
+      currentStrength: stats.currentStrength,
+      activeAlerts: stats.activeAlerts,
+      clientIP: req.ip
+    });
+
+    res.json(stats);
+  } catch (err) {
+    handleError(res, err, 'Stats fetch');
+  }
+});
+
+// ============================================================================
+// AUTH ROUTES
+// ============================================================================
+router.post('/auth/login', validateRequest(['username', 'password']), async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    
+    if (!user) {
+      logEvent('AUTH', `Login failed - User not found: ${username}`, { clientIP: req.ip });
+      return res.status(404).json({ message: 'User not found' });
+    }
+    
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      logEvent('AUTH', `Login failed - Invalid password: ${username}`, { clientIP: req.ip });
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { id: user._id, role: user.role }, 
+      process.env.JWT_SECRET || 'fallback-secret', 
+      { expiresIn: '1d' }
+    );
+    
+    logEvent('AUTH', `Login successful: ${username}`, { role: user.role, clientIP: req.ip });
+    
+    res.json({ 
+      token, 
+      user: { username: user.username, role: user.role },
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    handleError(res, err, 'Login');
+  }
+});
+
+router.post('/auth/register', validateRequest(['username', 'password']), async (req, res) => {
+  try {
+    const { username, password, role } = req.body;
     const hashed = await bcrypt.hash(password, 10);
     const user = new User({ username, password: hashed, role: role || 'Operator' });
     await user.save();
-    res.json({ message: 'User created' });
-  } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ message: 'Username already exists' });
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.put('/auth/profile', async (req, res) => {
-  const { oldUsername, newUsername, newPassword } = req.body;
-  try {
-    const user = await User.findOne({ username: oldUsername });
-    if (!user) return res.status(404).json({ message: 'User not found' });
     
-    if (newUsername) user.username = newUsername;
-    if (newPassword) {
-      user.password = await bcrypt.hash(newPassword, 10);
+    logEvent('AUTH', `User registered: ${username}`, { role: user.role, clientIP: req.ip });
+    res.json({ message: 'User created successfully', timestamp: new Date().toISOString() });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({ message: 'Username already exists' });
     }
-    await user.save();
-    res.json({ message: 'Profile updated successfully', user: { username: user.username, role: user.role } });
-  } catch (err) {
-    if (err.code === 11000) return res.status(400).json({ message: 'Username already taken' });
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Registration');
   }
 });
 
-// --- Zone Routes ---
+// ============================================================================
+// ZONE MANAGEMENT
+// ============================================================================
 router.get('/zones', async (req, res) => {
-  const zones = await Zone.find();
-  res.json(zones);
-});
-
-router.post('/zones', async (req, res) => {
-  const zone = new Zone(req.body);
-  await zone.save();
-  // emit to socket will happen via helper or simply client fetches again on new zone
-  res.json(zone);
-});
-
-router.delete('/zones/:id', async (req, res) => {
   try {
-    await Zone.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Zone deleted' });
+    const zones = await Zone.find();
+    logEvent('ZONES', 'Zones list requested', { count: zones.length, clientIP: req.ip });
+    res.json(zones);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Zones fetch');
   }
 });
 
-// Entry sensor → increment people inside
-router.post('/iot/entry', async (req, res) => {
-  const { count } = req.body;
-  try {
-    let zone = await Zone.findOne({ name: 'Entry' });
-    if (!zone) return res.status(404).json({ error: 'Entry zone not found' });
-
-    const n = count || 1;
-    zone.currentOccupancy += n;
-    zone.totalEntered = (zone.totalEntered || 0) + n;
-    updateZoneDensity(zone);
-    await zone.save();
-    await checkThreshold(zone, req.io);
-    req.io.emit('zone-update', zone);
-    res.json(zone);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Exit sensor → decrement people inside
-router.post('/iot/exit', async (req, res) => {
-  const { count } = req.body;
-  try {
-    let zone = await Zone.findOne({ name: 'Entry' });
-    if (!zone) return res.status(404).json({ error: 'Entry zone not found' });
-
-    const n = count || 1;
-    zone.currentOccupancy = Math.max(0, zone.currentOccupancy - n);
-    zone.totalExited = (zone.totalExited || 0) + n;
-    updateZoneDensity(zone);
-    await zone.save();
-    req.io.emit('zone-update', zone);
-    res.json(zone);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- Alerts ---
+// ============================================================================
+// ALERTS MANAGEMENT
+// ============================================================================
 router.get('/alerts', async (req, res) => {
-  const alerts = await Alert.find().populate('zoneId').sort({ createdAt: -1 }).limit(50);
-  res.json(alerts);
+  try {
+    const alerts = await Alert.find()
+      .populate('zoneId')
+      .sort({ createdAt: -1 })
+      .limit(50);
+    
+    logEvent('ALERTS', 'Alerts requested', { count: alerts.length, clientIP: req.ip });
+    res.json(alerts);
+  } catch (err) {
+    handleError(res, err, 'Alerts fetch');
+  }
 });
+
 router.patch('/alerts/:id/resolve', async (req, res) => {
   try {
-    const alert = await Alert.findByIdAndUpdate(req.params.id, { status: 'Resolved' }, { new: true }).populate('zoneId');
-    if (!alert) return res.status(404).json({ message: 'Alert not found' });
-    req.io.emit('alert-resolved', alert);
+    const alert = await Alert.findByIdAndUpdate(
+      req.params.id, 
+      { status: 'Resolved' }, 
+      { new: true }
+    ).populate('zoneId');
+    
+    if (!alert) {
+      return res.status(404).json({ message: 'Alert not found' });
+    }
+    
+    if (req.io) {
+      req.io.emit('alert-resolved', alert);
+    }
+    
+    logEvent('ALERTS', `Alert resolved: ${req.params.id}`, { clientIP: req.ip });
     res.json(alert);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Alert resolution');
   }
 });
+
 router.delete('/alerts', async (req, res) => {
   try {
-    await Alert.deleteMany({});
-    res.json({ message: 'All alerts cleared' });
+    const result = await Alert.deleteMany({});
+    logEvent('ALERTS', `All alerts cleared - Count: ${result.deletedCount}`, { clientIP: req.ip });
+    res.json({ message: 'All alerts cleared', deletedCount: result.deletedCount });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Alerts clear');
   }
 });
 
-// --- Missing Persons ---
-router.get('/missing-persons', async (req, res) => {
-  const persons = await MissingPerson.find().populate('lastSeenZone').sort({ createdAt: -1 });
-  res.json(persons);
-});
-router.post('/missing-persons', async (req, res) => {
-  const person = new MissingPerson(req.body);
-  await person.save();
-  res.json(person);
-});
-router.patch('/missing-persons/:id/found', async (req, res) => {
-  try {
-    const person = await MissingPerson.findByIdAndUpdate(req.params.id, { status: 'Found' }, { new: true }).populate('lastSeenZone');
-    if (!person) return res.status(404).json({ message: 'Not found' });
-    res.json(person);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- Analytics ---
+// ============================================================================
+// ANALYTICS
+// ============================================================================
 router.get('/analytics', async (req, res) => {
   try {
     const zone = await Zone.findOne({ name: 'Entry' });
@@ -168,45 +387,39 @@ router.get('/analytics', async (req, res) => {
     const resolvedAlerts = await Alert.countDocuments({ status: 'Resolved' });
     const missingCount = await MissingPerson.countDocuments({ status: 'Missing' });
     const foundCount = await MissingPerson.countDocuments({ status: 'Found' });
-    res.json({
+    
+    const analytics = {
       totalEntered: zone?.totalEntered || 0,
       totalExited: zone?.totalExited || 0,
       currentOccupancy: zone?.currentOccupancy || 0,
-      capacity: zone?.capacity || 0,
+      capacity: zone?.capacity || 15,
       densityStatus: zone?.densityStatus || 'Low',
       totalAlerts,
       resolvedAlerts,
       missingCount,
       foundCount,
-    });
+      timestamp: new Date().toISOString()
+    };
+    
+    logEvent('ANALYTICS', 'Analytics requested', { clientIP: req.ip });
+    res.json(analytics);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    handleError(res, err, 'Analytics fetch');
   }
 });
 
-// --- Dashboard Stats ---
-router.get('/stats', async (req, res) => {
-  const zone = await Zone.findOne({ name: 'Entry' });
-  const activeAlerts = await Alert.countDocuments({ status: 'Active' });
-  res.json({
-    totalEntered:    zone ? zone.totalEntered    : 0,
-    totalExited:     zone ? zone.totalExited     : 0,
-    currentStrength: zone ? zone.currentOccupancy : 0,
-    capacity:        zone ? zone.capacity         : 0,
-    densityStatus:   zone ? zone.densityStatus    : 'Low',
-    activeAlerts
-  });
-});
-
-// Helper Functions
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
 function updateZoneDensity(zone) {
   const ratio = zone.currentOccupancy / zone.capacity;
+  
   if (ratio >= 0.95) {
     zone.densityStatus = 'Critical';
     zone.colorCode = 'red';
   } else if (ratio >= 0.75) {
     zone.densityStatus = 'High';
-    zone.colorCode = 'orange'; // or yellow
+    zone.colorCode = 'orange';
   } else if (ratio >= 0.5) {
     zone.densityStatus = 'Medium';
     zone.colorCode = 'yellow';
@@ -214,21 +427,46 @@ function updateZoneDensity(zone) {
     zone.densityStatus = 'Low';
     zone.colorCode = 'green';
   }
+  
+  logEvent('DENSITY', `Density updated: ${zone.densityStatus}`, {
+    occupancy: zone.currentOccupancy,
+    capacity: zone.capacity,
+    ratio: Math.round(ratio * 100) + '%'
+  });
 }
 
 async function checkThreshold(zone, io) {
-  if (zone.densityStatus === 'Critical' || zone.densityStatus === 'High') {
-    const recent = await Alert.findOne({ zoneId: zone._id, status: 'Active' });
-    if (!recent) {
-      const alert = new Alert({
-        zoneId: zone._id,
-        message: `${zone.densityStatus} crowd density — ${zone.currentOccupancy} people inside`,
-        severity: zone.densityStatus === 'Critical' ? 'Critical' : 'High'
+  try {
+    if (zone.densityStatus === 'Critical' || zone.densityStatus === 'High') {
+      const recent = await Alert.findOne({ 
+        zoneId: zone._id, 
+        status: 'Active',
+        createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // Last 5 minutes
       });
-      await alert.save();
-      const populated = await Alert.findById(alert._id).populate('zoneId');
-      io.emit('new-alert', populated);
+      
+      if (!recent) {
+        const alert = new Alert({
+          zoneId: zone._id,
+          message: `${zone.densityStatus} crowd density — ${zone.currentOccupancy} people inside (${Math.round((zone.currentOccupancy / zone.capacity) * 100)}% capacity)`,
+          severity: zone.densityStatus === 'Critical' ? 'Critical' : 'High'
+        });
+        
+        await alert.save();
+        const populated = await Alert.findById(alert._id).populate('zoneId');
+        
+        if (io) {
+          io.emit('new-alert', populated);
+        }
+        
+        logEvent('ALERT', `New ${zone.densityStatus} alert created`, {
+          occupancy: zone.currentOccupancy,
+          capacity: zone.capacity,
+          alertId: alert._id
+        });
+      }
     }
+  } catch (err) {
+    logEvent('ERROR', 'Threshold check failed', { error: err.message });
   }
 }
 

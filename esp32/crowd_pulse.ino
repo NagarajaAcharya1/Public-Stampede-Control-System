@@ -1,331 +1,447 @@
+/*
+ * CrowdPulse ESP32 - BULLETPROOF COUNTING SYSTEM
+ * 
+ * CRITICAL FIX: Exit sensor will ONLY count if people are inside
+ * - Entry: Always allowed (totalEntered++, currentInside++)
+ * - Exit: ONLY if currentInside > 0 (totalExited++, currentInside--)
+ * - If currentInside == 0: EXIT IS COMPLETELY IGNORED
+ */
+
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 
-// =============================================
-// CrowdPulse — ESP32 + 2 IR Sensors + Buzzer
-// Dynamic WiFi Provisioning Version
-// =============================================
+// Hardware pins
+#define ENTRY_SENSOR    34
+#define EXIT_SENSOR     35
+#define BUZZER          25
+#define RESET_BUTTON    0
 
-// -------- SERVER --------
-const char *SERVER = "http://10.61.190.197:5000";
+// Timing parameters
+#define COOLDOWN_MS     800
+#define SERVER_TIMEOUT  5000
 
-// -------- PINS --------
-#define ENTRY_SENSOR 34
-#define EXIT_SENSOR 35
-#define BUZZER 25
+// Global variables
+Preferences preferences;
+WiFiManager wifiManager;
+String serverURL = "";
 
-// -------- SETTINGS --------
-const unsigned long COOLDOWN_MS = 1200;
-const unsigned long WIFI_RETRY_MS = 5000;
-const int MAX_PEOPLE = 15;
+// BULLETPROOF COUNTING SYSTEM
+struct CountingSystem {
+  int totalEntered = 0;    // Total people who entered
+  int totalExited = 0;     // Total people who exited
+  int currentInside = 0;   // People currently inside
+  
+  // Add entry (always allowed)
+  void addEntry() {
+    totalEntered++;
+    currentInside++;
+    Serial.printf("✅ ENTRY: Total=%d, Inside=%d\n", totalEntered, currentInside);
+  }
+  
+  // Add exit (ONLY if people inside)
+  bool addExit() {
+    if (currentInside > 0) {
+      totalExited++;
+      currentInside--;
+      Serial.printf("✅ EXIT: Total=%d, Inside=%d\n", totalExited, currentInside);
+      return true; // Valid exit
+    } else {
+      Serial.printf("❌ EXIT IGNORED: No people inside (Inside=%d)\n", currentInside);
+      return false; // Invalid exit - ignored
+    }
+  }
+  
+  // Validate counting logic
+  bool isValid() {
+    return (currentInside >= 0 && 
+            totalExited <= totalEntered && 
+            currentInside == (totalEntered - totalExited));
+  }
+  
+  void printStatus() {
+    Serial.println("📊 COUNTING STATUS:");
+    Serial.printf("   Entered: %d\n", totalEntered);
+    Serial.printf("   Exited:  %d\n", totalExited);
+    Serial.printf("   Inside:  %d\n", currentInside);
+    Serial.printf("   Valid:   %s\n", isValid() ? "✅" : "❌");
+  }
+} counts;
 
-// -------- STATE --------
-int peopleCount = 0;
+// Sensor states
 int lastEntryState = HIGH;
 int lastExitState = HIGH;
-
 unsigned long lastEntryTime = 0;
 unsigned long lastExitTime = 0;
-unsigned long lastWifiRetry = 0;
 
-// -------- NON-BLOCKING BUZZER --------
+// Buzzer system
 bool buzzerActive = false;
 int buzzerBeeps = 0;
 int buzzerTarget = 0;
-bool buzzerOn = false;
 unsigned long buzzerLastMs = 0;
 
-const int BEEP_ON_MS = 120;
-const int BEEP_OFF_MS = 120;
-
-// -------- PENDING HTTP QUEUE --------
-bool pendingEntry = false;
-bool pendingExit = false;
-
-// =============================================
-void setup()
-{
-
+void setup() {
   Serial.begin(115200);
   delay(1000);
-
-  pinMode(ENTRY_SENSOR, INPUT);
-  pinMode(EXIT_SENSOR, INPUT);
-
+  
+  Serial.println("🚀 CrowdPulse ESP32 - BULLETPROOF COUNTING");
+  Serial.println("==========================================");
+  
+  // Initialize hardware
+  pinMode(ENTRY_SENSOR, INPUT_PULLUP);
+  pinMode(EXIT_SENSOR, INPUT_PULLUP);
   pinMode(BUZZER, OUTPUT);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
   digitalWrite(BUZZER, LOW);
-
-  setupWiFi();
+  
+  // Initialize preferences
+  preferences.begin("crowdpulse", false);
+  
+  // Test buzzer
+  testBuzzer();
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Discover server
+  discoverServer();
+  
+  Serial.println("✅ System ready - Bulletproof counting active!");
+  counts.printStatus();
 }
 
-// =============================================
-// WIFI MANAGER SETUP
-// =============================================
-void setupWiFi()
-{
+void testBuzzer() {
+  Serial.println("🔊 Testing buzzer...");
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER, HIGH);
+    delay(100);
+    digitalWrite(BUZZER, LOW);
+    delay(100);
+  }
+}
 
-  WiFiManager wm;
-
-  // OPTIONAL:
-  // Uncomment this if you want to reset saved WiFi
-  // wm.resetSettings();
-
-  Serial.println("\nStarting WiFi Manager...");
-
-  bool connected;
-
-  connected = wm.autoConnect("CrowdPulse-Setup");
-
-  if (!connected)
-  {
-
-    Serial.println("WiFi Failed!");
+void connectToWiFi() {
+  Serial.println("📶 Connecting to WiFi...");
+  
+  String savedSSID = preferences.getString("wifi_ssid", "");
+  String savedPass = preferences.getString("wifi_pass", "");
+  
+  if (savedSSID.length() > 0) {
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✅ WiFi connected!");
+      Serial.println("IP: " + WiFi.localIP().toString());
+      return;
+    }
+  }
+  
+  // Start WiFi configuration portal
+  Serial.println("\n🔧 Starting WiFi setup...");
+  String apName = "CrowdPulse-" + String(ESP.getEfuseMac(), HEX);
+  
+  Serial.println("📱 CONNECT TO WIFI:");
+  Serial.println("   Hotspot: " + apName);
+  Serial.println("   Password: crowd123");
+  Serial.println("   Setup URL: http://192.168.4.1");
+  
+  if (wifiManager.autoConnect(apName.c_str(), "crowd123")) {
+    Serial.println("✅ WiFi connected via portal!");
+    preferences.putString("wifi_ssid", WiFi.SSID());
+    preferences.putString("wifi_pass", WiFi.psk());
+  } else {
+    Serial.println("❌ WiFi connection failed!");
     ESP.restart();
   }
-
-  Serial.println("=================================");
-  Serial.println("WiFi Connected Successfully");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-  Serial.println("=================================");
 }
 
-// =============================================
-// NON-BLOCKING POST
-// =============================================
-bool postToServer(const char *endpoint)
-{
-
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    return false;
+void discoverServer() {
+  Serial.println("🔍 Discovering server...");
+  
+  IPAddress localIP = WiFi.localIP();
+  String networkBase = String(localIP[0]) + "." + String(localIP[1]) + "." + String(localIP[2]) + ".";
+  
+  // Get your computer's likely IP
+  IPAddress gatewayIP = WiFi.gatewayIP();
+  String computerIP = String(gatewayIP[0]) + "." + String(gatewayIP[1]) + "." + String(gatewayIP[2]) + ".";
+  
+  String candidates[] = {
+    "10.61.190.197",        // Your computer's actual IP
+    computerIP + "44",        // Common computer IP
+    networkBase + "1",        // Router
+    networkBase + "100",      // Common DHCP range
+    networkBase + "44",       // Your computer might be here
+    "192.168.1.44",          // Fallback
+    "10.0.0.44"              // Another fallback
+  };
+  
+  for (String candidate : candidates) {
+    String testURL = "http://" + candidate + ":5000";
+    Serial.println("Testing: " + testURL);
+    
+    if (testServerConnection(testURL)) {
+      serverURL = testURL;
+      Serial.println("✅ Server found: " + serverURL);
+      triggerBuzzer(2);
+      return;
+    }
   }
+  
+  // Try gateway IP as last resort
+  serverURL = "http://" + WiFi.gatewayIP().toString() + ":5000";
+  Serial.println("⚠️ Using fallback: " + serverURL);
+  triggerBuzzer(3);
+}
 
+bool testServerConnection(String url) {
   HTTPClient http;
-
-  String url = String(SERVER) + endpoint;
-
-  http.begin(url);
-
-  http.addHeader("Content-Type", "application/json");
-
+  http.begin(url + "/api/stats");
   http.setTimeout(3000);
-
-  int code = http.POST("{\"count\":1}");
-
+  
+  int httpCode = http.GET();
   http.end();
+  
+  return (httpCode == 200);
+}
 
-  if (code == 200 || code == 201)
-  {
-
-    Serial.printf("POST %s -> %d\n", endpoint, code);
-
-    return true;
+bool readSensorDebounced(int pin) {
+  int lowCount = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    if (digitalRead(pin) == LOW) {
+      lowCount++;
+    }
+    delay(10);
   }
-  else
-  {
+  
+  return (lowCount >= 2);
+}
 
-    Serial.printf("POST %s FAILED -> %d\n", endpoint, code);
+void processSensors() {
+  unsigned long now = millis();
+  
+  int entryState = digitalRead(ENTRY_SENSOR);
+  int exitState = digitalRead(EXIT_SENSOR);
+  
+  // ==========================================
+  // ENTRY SENSOR - ALWAYS ALLOWED
+  // ==========================================
+  if (lastEntryState == HIGH && entryState == LOW && 
+      (now - lastEntryTime > COOLDOWN_MS)) {
+    
+    if (readSensorDebounced(ENTRY_SENSOR)) {
+      lastEntryTime = now;
+      
+      // BULLETPROOF ENTRY LOGIC
+      counts.addEntry();
+      
+      // Audio feedback
+      if (counts.currentInside > 15) {
+        triggerBuzzer(6); // Overcrowd alert
+      } else {
+        triggerBuzzer(1); // Normal beep
+      }
+      
+      // Send to server
+      postToServer("/api/iot/entry");
+      counts.printStatus();
+    }
+  }
+  
+  // ==========================================
+  // EXIT SENSOR - BULLETPROOF LOGIC
+  // ==========================================
+  if (lastExitState == HIGH && exitState == LOW && 
+      (now - lastExitTime > COOLDOWN_MS)) {
+    
+    if (readSensorDebounced(EXIT_SENSOR)) {
+      lastExitTime = now;
+      
+      // BULLETPROOF EXIT LOGIC - ONLY IF PEOPLE INSIDE
+      if (counts.addExit()) {
+        // Valid exit - send to server
+        triggerBuzzer(1); // Normal beep
+        postToServer("/api/iot/exit");
+        counts.printStatus();
+      } else {
+        // Invalid exit - completely ignored
+        triggerBuzzer(3); // Warning beeps
+        Serial.println("⚠️ EXIT SENSOR TRIGGERED BUT IGNORED!");
+        Serial.println("⚠️ REASON: No people inside to exit");
+        
+        // Optionally send warning to server
+        postInvalidExitWarning();
+      }
+    }
+  }
+  
+  // Update sensor states
+  lastEntryState = entryState;
+  lastExitState = exitState;
+}
 
+bool postToServer(const char* endpoint) {
+  if (WiFi.status() != WL_CONNECTED || serverURL.length() == 0) {
+    return false;
+  }
+  
+  HTTPClient http;
+  String url = serverURL + endpoint;
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(SERVER_TIMEOUT);
+  
+  // Send current counts for server validation
+  String payload = "{";
+  payload += "\"count\":1,";
+  payload += "\"deviceId\":\"" + WiFi.macAddress() + "\",";
+  payload += "\"totalEntered\":" + String(counts.totalEntered) + ",";
+  payload += "\"totalExited\":" + String(counts.totalExited) + ",";
+  payload += "\"currentInside\":" + String(counts.currentInside);
+  payload += "}";
+  
+  int httpCode = http.POST(payload);
+  String response = http.getString();
+  http.end();
+  
+  if (httpCode == 200) {
+    Serial.printf("✅ POST %s → Success\n", endpoint);
+    return true;
+  } else {
+    Serial.printf("❌ POST %s → Error %d\n", endpoint, httpCode);
+    if (response.length() > 0) {
+      Serial.println("Response: " + response);
+    }
     return false;
   }
 }
 
-// =============================================
-// BUZZER CONTROL
-// =============================================
-void triggerBuzzer(int beeps)
-{
-
-  if (buzzerActive)
+void postInvalidExitWarning() {
+  if (WiFi.status() != WL_CONNECTED || serverURL.length() == 0) {
     return;
+  }
+  
+  HTTPClient http;
+  String url = serverURL + "/api/iot/invalid-exit";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(SERVER_TIMEOUT);
+  
+  String payload = "{";
+  payload += "\"deviceId\":\"" + WiFi.macAddress() + "\",";
+  payload += "\"message\":\"Invalid exit ignored - no people inside\",";
+  payload += "\"currentInside\":" + String(counts.currentInside);
+  payload += "}";
+  
+  int httpCode = http.POST(payload);
+  http.end();
+  
+  if (httpCode == 200) {
+    Serial.println("✅ Invalid exit warning sent to server");
+  }
+}
 
+void triggerBuzzer(int beeps) {
+  if (buzzerActive) return;
+  
   buzzerTarget = beeps;
   buzzerBeeps = 0;
-  buzzerOn = false;
-
   buzzerActive = true;
-
   buzzerLastMs = millis();
 }
 
-// =============================================
-void updateBuzzer()
-{
-
-  if (!buzzerActive)
-    return;
-
+void updateBuzzer() {
+  if (!buzzerActive) return;
+  
   unsigned long now = millis();
-
-  unsigned long interval =
-      buzzerOn ? BEEP_ON_MS : BEEP_OFF_MS;
-
-  if (now - buzzerLastMs >= interval)
-  {
-
+  static bool buzzerOn = false;
+  
+  if (now - buzzerLastMs >= (buzzerOn ? 100 : 150)) {
     buzzerLastMs = now;
-
-    if (!buzzerOn)
-    {
-
+    
+    if (!buzzerOn) {
       digitalWrite(BUZZER, HIGH);
-
       buzzerOn = true;
-    }
-    else
-    {
-
+    } else {
       digitalWrite(BUZZER, LOW);
-
       buzzerOn = false;
-
       buzzerBeeps++;
-
-      if (buzzerBeeps >= buzzerTarget)
-      {
-
+      
+      if (buzzerBeeps >= buzzerTarget) {
         buzzerActive = false;
       }
     }
   }
 }
 
-// =============================================
-void reconnectWiFi()
-{
-
-  if (WiFi.status() == WL_CONNECTED)
-    return;
-
-  Serial.println("WiFi Lost! Reconnecting...");
-
-  WiFi.reconnect();
+void checkResetButton() {
+  static unsigned long resetStart = 0;
+  static bool resetPressed = false;
+  
+  bool buttonPressed = (digitalRead(RESET_BUTTON) == LOW);
+  
+  if (buttonPressed && !resetPressed) {
+    resetPressed = true;
+    resetStart = millis();
+    Serial.println("🔄 Reset button pressed...");
+  }
+  
+  if (buttonPressed && resetPressed) {
+    if (millis() - resetStart >= 3000) {
+      Serial.println("🔄 FACTORY RESET!");
+      
+      // Clear all data
+      preferences.clear();
+      wifiManager.resetSettings();
+      
+      // Reset counts
+      counts.totalEntered = 0;
+      counts.totalExited = 0;
+      counts.currentInside = 0;
+      
+      // Buzzer feedback
+      for (int i = 0; i < 5; i++) {
+        digitalWrite(BUZZER, HIGH);
+        delay(100);
+        digitalWrite(BUZZER, LOW);
+        delay(100);
+      }
+      
+      ESP.restart();
+    }
+  }
+  
+  if (!buttonPressed) {
+    resetPressed = false;
+  }
 }
 
-// =============================================
-void loop()
-{
-
-  unsigned long now = millis();
-
-  // ===========================================
-  // WIFI RECONNECT
-  // ===========================================
-  if (WiFi.status() != WL_CONNECTED &&
-      (now - lastWifiRetry > WIFI_RETRY_MS))
-  {
-
-    lastWifiRetry = now;
-
-    reconnectWiFi();
-  }
-
-  // ===========================================
-  // RETRY FAILED POSTS
-  // ===========================================
-  if (pendingEntry &&
-      postToServer("/api/iot/entry"))
-  {
-
-    pendingEntry = false;
-  }
-
-  if (pendingExit &&
-      postToServer("/api/iot/exit"))
-  {
-
-    pendingExit = false;
-  }
-
-  // ===========================================
-  // SENSOR READINGS
-  // ===========================================
-  int entryState = digitalRead(ENTRY_SENSOR);
-
-  int exitState = digitalRead(EXIT_SENSOR);
-
-  // ===========================================
-  // ENTRY DETECT
-  // ===========================================
-  if (lastEntryState == HIGH &&
-      entryState == LOW &&
-      (now - lastEntryTime > COOLDOWN_MS))
-  {
-
-    lastEntryTime = now;
-
-    peopleCount++;
-
-    Serial.printf(
-        "ENTERED | Count: %d\n",
-        peopleCount);
-
-    if (!postToServer("/api/iot/entry"))
-    {
-
-      pendingEntry = true;
-    }
-
-    // OVERCROWD ALERT
-    if (peopleCount > MAX_PEOPLE)
-    {
-
-      buzzerActive = false;
-
-      triggerBuzzer(6);
-
-      Serial.println(
-          "!!! OVERCROWD ALERT !!!");
-    }
-    else
-    {
-
-      triggerBuzzer(1);
-    }
-  }
-
-  // ===========================================
-  // EXIT DETECT
-  // ===========================================
-  if (lastExitState == HIGH &&
-      exitState == LOW &&
-      (now - lastExitTime > COOLDOWN_MS))
-  {
-
-    lastExitTime = now;
-
-    if (peopleCount > 0)
-    {
-
-      peopleCount--;
-    }
-
-    Serial.printf(
-        "EXITED | Count: %d\n",
-        peopleCount);
-
-    triggerBuzzer(1);
-
-    if (!postToServer("/api/iot/exit"))
-    {
-
-      pendingExit = true;
-    }
-  }
-
-  // ===========================================
-  // UPDATE STATES
-  // ===========================================
-  lastEntryState = entryState;
-
-  lastExitState = exitState;
-
-  // ===========================================
-  // UPDATE BUZZER
-  // ===========================================
+void loop() {
+  // Process sensors (highest priority)
+  processSensors();
+  
+  // Update buzzer
   updateBuzzer();
-
+  
+  // Check reset button
+  checkResetButton();
+  
+  // Validate counting system
+  if (!counts.isValid()) {
+    Serial.println("❌ CRITICAL ERROR: Invalid counting state!");
+    counts.printStatus();
+  }
+  
   delay(10);
 }
